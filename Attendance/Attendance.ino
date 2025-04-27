@@ -1,17 +1,26 @@
 #include <WiFi.h>
-#include <FirebaseESP32.h>
+#include <Firebase.h>
 #include <SPI.h>
 #include <MFRC522.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <UbidotsESPMQTT.h>
+
+#define TOKEN "BBUS-byrMkHkt4r6DV55zMBaseWa4NlbEtY"
+#define DEVICE_LABEL "attendance-device"
+#define ATTENDANCE_VARIABLE_LABEL "attendance"
+#define LOGS_VARIABLE_LABEL "logs"
+#define UID_VARIABLE_LABEL "uid"
+Ubidots client(TOKEN);
 
 // WiFi credentials
 #define WIFI_SSID "Hatem's S21 ultra"
-#define WIFI_PASSWORD "Hatem_12"
+#define WIFI_PASSWORD "Hatem_24"
 
 // Firebase credentials
-#define FIREBASE_HOST "https://student-attendance-syste-8f1a5-default-rtdb.firebaseio.com/"
-#define FIREBASE_AUTH "dqizmZeCvJxtznOab1n10qyZo8oa5NgIFzkSdpvF"
+#define FIREBASE_TOKEN "dqizmZeCvJxtznOab1n10qyZo8oa5NgIFzkSdpvF"
+#define FIREBASE_URL "https://student-attendance-syste-8f1a5-default-rtdb.firebaseio.com/"
+Firebase fb(FIREBASE_URL, FIREBASE_TOKEN);
 
 // OLED display setup
 #define SCREEN_WIDTH 128
@@ -27,15 +36,10 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #define BUZZER_PIN 27
 MFRC522 rfid(SS_PIN, RST_PIN);
 
-// Firebase objects
-FirebaseData firebaseData;
-FirebaseAuth firebaseAuth;
-FirebaseConfig firebaseConfig;
-
 // Lecture start time (10:00 AM)
 const int lectureStartHour = 10;
 const int lectureStartMinute = 0;
-
+void callback(char* topic, byte* payload, unsigned int length);
 void connectToWiFi();
 void configureTime();
 void showMessage(String msg);
@@ -67,16 +71,19 @@ void setup() {
     connectToWiFi();
     configureTime();
 
-    // Firebase setup
-    firebaseConfig.host = FIREBASE_HOST;
-    firebaseConfig.signer.tokens.legacy_token = FIREBASE_AUTH;
-    Firebase.begin(&firebaseConfig, &firebaseAuth);
-    Firebase.reconnectWiFi(true);
+    client.setDebug(true);
+    client.wifiConnection(WIFI_SSID, WIFI_PASSWORD);
+    client.begin(callback);
 
     resetToReadyMessage();
 }
 
 void loop() {
+    if (!client.connected()) {
+      client.reconnect();
+    }
+    client.loop();
+
     if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
         return;
     }
@@ -99,17 +106,26 @@ void loop() {
 
     // Store attendance or log unauthorized access
     if (authorized) {
+        logScan(uidString, true);
         recordAttendance(uidString, attendanceTime, lateMinutes);
         showMessage("Access Granted");
         Serial.println("Access Granted");
         digitalWrite(GREEN_LED, HIGH);
         beep(1, 200);
+        client.add(LOGS_VARIABLE_LABEL, 1);
+        client.add(ATTENDANCE_VARIABLE_LABEL, 1);
+        client.add(UID_VARIABLE_LABEL, uidString.toDouble());
+        client.ubidotsPublish(DEVICE_LABEL);
     } else {
-        logScan(uidString, authorized);
+        logScan(uidString, false);
         showMessage("Access Denied");
         Serial.println("Access Denied");
         digitalWrite(RED_LED, HIGH);
         beep(2, 400);
+        client.add(LOGS_VARIABLE_LABEL, 1);
+        client.add(ATTENDANCE_VARIABLE_LABEL, 0);
+        client.add(UID_VARIABLE_LABEL, uidString.toDouble());
+        client.ubidotsPublish(DEVICE_LABEL);
     }
 
     delay(3000);
@@ -170,31 +186,22 @@ String getUIDAsNumber(byte *uid, byte size) {
 }
 
 bool isAuthorized(String uid) {
-    if (Firebase.getInt(firebaseData, "/authorized/" + uid)) {
-        return firebaseData.intData() == 1;
-    } else {
-        Serial.println("Error checking authorization: " + firebaseData.errorReason());
-        return false;
-    }
+    String path = "authorized/" + uid;
+    int result = fb.getInt(path);
+    return (result == 1);
 }
 
 void recordAttendance(String uid, String attendanceTime, int lateMinutes) {
     String attendanceRecord = attendanceTime + ", " + String(lateMinutes);
-    if (Firebase.setString(firebaseData, "/attendance/" + uid, attendanceRecord)) {
-        Serial.println("Attendance recorded for UID: " + uid);
-    } else {
-        Serial.println("Error recording attendance: " + firebaseData.errorReason());
-    }
+    String path = "attendance/" + uid;
+    fb.setString(path, attendanceRecord);
+    
 }
 
 void logScan(String uid, bool authorized) {
     String status = authorized ? "Authorized" : "Unauthorized";
-    String logPath = "/logs/" + String(millis());
-    if (Firebase.setString(firebaseData, logPath, "UID: " + uid + ", Status: " + status)) {
-        Serial.println("Log recorded: " + status + " UID: " + uid);
-    } else {
-        Serial.println("Error logging scan: " + firebaseData.errorReason());
-    }
+    String logPath = "logs/" + String(millis());
+    fb.setString(logPath, "UID: " + uid + ", Status: " + status);
 }
 
 void beep(int times, int duration) {
@@ -219,4 +226,17 @@ void resetToReadyMessage() {
     display.setCursor(10, 10);
     display.println("ESP32 RFID Ready...");
     display.display();
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.println("===== Incoming MQTT Message =====");
+  Serial.print("Topic: ");
+  Serial.println(topic);
+  String message = "";
+  Serial.print("Payload: ");
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+    message += (char)payload[i];
+  }
+  Serial.println("=================================\n");
 }
